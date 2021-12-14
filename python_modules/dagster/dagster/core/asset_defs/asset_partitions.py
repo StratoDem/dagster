@@ -16,7 +16,7 @@ def get_upstream_partitions_for_partition_range(
     """
 
     if downstream_assets_def.partitions_def is None:
-        check.failed("downstream asset is not partitioned")
+        return PartitionKeyRange(None, None)
 
     if upstream_assets_def.partitions_def is None:
         check.failed("upstream asset is not partitioned")

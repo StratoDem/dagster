@@ -48,6 +48,28 @@ def test_assets_with_same_partitioning():
     )
 
 
+def test_unpartitioned_asset_depends_on_partitioned_asset():
+    partitions_def = StaticPartitionsDefinition(["a", "b", "c", "d"])
+
+    @asset(partitions_def=partitions_def)
+    def upstream_asset():
+        pass
+
+    @asset
+    def downstream_asset(upstream_asset):
+        assert upstream_asset
+
+    assert (
+        get_upstream_partitions_for_partition_range(
+            downstream_asset,
+            upstream_asset,
+            AssetKey("upstream_asset"),
+            None,
+        )
+        == PartitionKeyRange(None, None)
+    )
+
+
 def test_filter_mapping_partitions_dep():
     downstream_partitions = ["john", "ringo", "paul", "george"]
     upstream_partitions = [
