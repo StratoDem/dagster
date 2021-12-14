@@ -1,4 +1,16 @@
-from typing import AbstractSet, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    AbstractSet,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 from dagster import check
 from dagster.core.definitions.config import ConfigMapping
@@ -14,7 +26,8 @@ from dagster.core.definitions.graph_definition import GraphDefinition
 from dagster.core.definitions.job_definition import JobDefinition
 from dagster.core.definitions.op_definition import OpDefinition
 from dagster.core.definitions.output import Out, OutputDefinition
-from dagster.core.definitions.partition import PartitionedConfig
+from dagster.core.definitions.partition import PartitionedConfig, PartitionsDefinition
+from dagster.core.definitions.partition_key_range import PartitionKeyRange
 from dagster.core.definitions.resource_definition import ResourceDefinition
 from dagster.core.errors import DagsterInvalidDefinitionError
 from dagster.core.execution.context.input import InputContext, build_input_context
@@ -24,6 +37,7 @@ from dagster.utils.backcompat import experimental
 from dagster.utils.merger import merge_dicts
 
 from .asset import AssetsDefinition
+from .asset_partitions import get_upstream_partitions_for_partition_range
 from .foreign_asset import ForeignAsset
 
 
@@ -79,6 +93,7 @@ def build_assets_job(
 
     op_defs = build_op_deps(assets, source_assets_by_key.keys())
     root_manager = build_root_manager(source_assets_by_key)
+    partitions_def, tags_for_partition_fn = build_job_partitions_from_assets(assets)
 
     return GraphDefinition(
         name=name,
@@ -93,7 +108,62 @@ def build_assets_job(
         config=config,
         tags=tags,
         executor_def=executor_def,
+        partitions_def=partitions_def,
+        tags_for_partition_fn=tags_for_partition_fn,
     )
+
+
+def build_job_partitions_from_assets(
+    assets: Sequence[AssetsDefinition],
+) -> Tuple[PartitionsDefinition, Callable[[str], Mapping[str, Any]]]:
+    assets_defs_by_asset_key = {
+        asset_key: assets_def for assets_def in assets for asset_key in assets_def.asset_keys
+    }
+
+    def asset_partitions_for_job_partition(
+        job_partition_key: str,
+    ) -> Mapping[AssetKey, PartitionKeyRange]:
+        return {
+            asset_key: PartitionKeyRange(job_partition_key, job_partition_key)
+            for assets_def in assets
+            for asset_key in assets_def.asset_keys
+            if assets_def.partitions_def
+        }
+
+    def tags_for_partition_fn(partition_key: str) -> Mapping[str, Any]:
+        asset_partitions_tag_value: Dict[str, Dict[str, Mapping[str, str]]] = {}
+        asset_partitions_by_asset_key = asset_partitions_for_job_partition(partition_key)
+
+        for assets_def in assets:
+            outputs_dict = {}
+            if assets_def.partitions_def is not None:
+                for asset_key, output_def in assets_def.output_defs_by_asset_key.items():
+                    asset_partition_key_range = asset_partitions_by_asset_key[asset_key]
+                    outputs_dict[output_def.name] = {
+                        "start": asset_partition_key_range.start,
+                        "end": asset_partition_key_range.end,
+                    }
+
+            inputs_dict = {}
+            for in_asset_key, input_def in assets_def.input_defs_by_asset_key.items():
+                upstream_assets_def = assets_defs_by_asset_key[in_asset_key]
+                if upstream_assets_def.partitions_def is not None:
+                    upstream_partition_key_range = get_upstream_partitions_for_partition_range(
+                        assets_def, upstream_assets_def, in_asset_key, asset_partition_key_range
+                    )
+                    inputs_dict[input_def.name] = {
+                        "start": upstream_partition_key_range.start,
+                        "end": upstream_partition_key_range.end,
+                    }
+
+            asset_partitions_tag_value[assets_def.op.name] = {
+                "inputs": inputs_dict,
+                "outputs": outputs_dict,
+            }
+
+        return {"asset_partitions": asset_partitions_tag_value}
+
+    return assets[0].partitions_def, tags_for_partition_fn
 
 
 def build_source_assets_by_key(
