@@ -61,6 +61,13 @@ class ExecuteInProcessResult:
 
         return _filter_events_by_handle(self._event_list, NodeHandle.from_string(node_name))
 
+    def asset_materializations_for_node(self, node_name) -> List[DagsterEvent]:
+        return [
+            event.event_specific_data.materialization
+            for event in self.events_for_node(node_name)
+            if event.event_type_value == "ASSET_MATERIALIZATION"
+        ]
+
     def output_value(self, output_name: str = DEFAULT_OUTPUT) -> Any:
         """Retrieves output of top-level job, if an output is returned.
 
