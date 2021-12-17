@@ -502,7 +502,7 @@ class DagsterKubernetesClient:
             else:
                 raise DagsterK8sError("Should not get here, unknown pod state")
 
-    def retrieve_pod_logs(self, pod_name: str, namespace: str) -> str:
+    def retrieve_pod_logs(self, pod_name: str, namespace: str, container=None) -> str:
         """Retrieves the raw pod logs for the pod named `pod_name` from Kubernetes.
 
         Args:
@@ -520,6 +520,11 @@ class DagsterKubernetesClient:
         # us with invalid JSON as the quotes have been switched to '
         #
         # https://github.com/kubernetes-client/python/issues/811
-        return self.core_api.read_namespaced_pod_log(
-            name=pod_name, namespace=namespace, _preload_content=False
-        ).data.decode("utf-8")
+        if container:
+            return self.core_api.read_namespaced_pod_log(
+                name=pod_name, namespace=namespace, _preload_content=False, container=container
+            ).data.decode("utf-8")
+        else:
+            return self.core_api.read_namespaced_pod_log(
+                name=pod_name, namespace=namespace, _preload_content=False
+            ).data.decode("utf-8")
