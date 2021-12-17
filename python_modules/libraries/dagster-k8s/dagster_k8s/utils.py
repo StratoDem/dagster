@@ -10,9 +10,11 @@ from .client import (
 )
 
 
-def retrieve_pod_logs(pod_name, namespace):
-    return DagsterKubernetesClient.production_client().retrieve_pod_logs(pod_name, namespace)
-
+def retrieve_pod_logs(pod_name, namespace, container = None):
+    if container:
+        return DagsterKubernetesClient.production_client().retrieve_pod_logs(pod_name, namespace, container=container)
+    else:
+        return DagsterKubernetesClient.production_client().retrieve_pod_logs(pod_name, namespace)
 
 def get_pods_in_job(job_name, namespace):
     return DagsterKubernetesClient.production_client().get_pods_in_job(job_name, namespace)
