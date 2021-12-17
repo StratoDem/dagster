@@ -519,7 +519,10 @@ def create_k8s_job_task(celery_app, **task_kwargs):
         logs = []
         for pod_name in pod_names:
             try:
-                raw_logs = retrieve_pod_logs(pod_name, namespace=job_namespace)
+                try:
+                    raw_logs = retrieve_pod_logs(pod_name, namespace=job_namespace)
+                except Exception as e:
+                    raw_logs = retrieve_pod_logs(pod_name, namespace=job_namespace, container='dagster')
                 logs += raw_logs.split("\n")
             except kubernetes.client.rest.ApiException as e:
                 instance.report_engine_event(
