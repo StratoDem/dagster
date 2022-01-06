@@ -2,8 +2,13 @@ import graphene
 from dagster import AssetKey, check
 from dagster.core.events.log import EventLogEntry
 from dagster.core.host_representation import ExternalRepository
-from dagster.core.host_representation.external_data import ExternalAssetNode
+from dagster.core.host_representation.external_data import (
+    ExternalAssetNode,
+    ExternalStaticPartitionsDefinitionData,
+    ExternalTimeWindowPartitionsDefinitionData,
+)
 
+from . import external
 from .asset_key import GrapheneAssetKey
 from .errors import GrapheneAssetNotFoundError
 from .pipelines.pipeline import GrapheneAssetMaterialization, GraphenePipeline
@@ -36,8 +41,8 @@ class GrapheneAssetNode(graphene.ObjectType):
     assetKey = graphene.NonNull(GrapheneAssetKey)
     description = graphene.String()
     opName = graphene.String()
-    jobName = graphene.String()
     jobs = non_null_list(GraphenePipeline)
+    repository = graphene.NonNull(lambda: external.GrapheneRepository)
     dependencies = non_null_list(GrapheneAssetDependency)
     dependedBy = non_null_list(GrapheneAssetDependency)
     dependencyKeys = non_null_list(GrapheneAssetKey)
@@ -47,6 +52,11 @@ class GrapheneAssetNode(graphene.ObjectType):
         partitions=graphene.List(graphene.String),
         beforeTimestampMillis=graphene.String(),
         limit=graphene.Int(),
+    )
+    partitionKeys = non_null_list(graphene.String)
+    latestMaterializationByPartition = graphene.Field(
+        graphene.NonNull(graphene.List(GrapheneAssetMaterialization)),
+        partitions=graphene.List(graphene.String),
     )
 
     class Meta:
@@ -79,8 +89,14 @@ class GrapheneAssetNode(graphene.ObjectType):
             assetKey=external_asset_node.asset_key,
             opName=external_asset_node.op_name,
             description=external_asset_node.op_description,
-            jobName=external_asset_node.job_names[0] if external_asset_node.job_names else None,
         )
+
+    def resolve_repository(self, _graphene_info):
+        loc = None
+        for location in _graphene_info.context.repository_locations:
+            if self._external_repository in location.get_repositories().values():
+                loc = location
+        return external.GrapheneRepository(self._external_repository, loc)
 
     def resolve_dependencies(self, _graphene_info):
         return [
@@ -152,6 +168,52 @@ class GrapheneAssetNode(graphene.ObjectType):
             GraphenePipeline(self._external_repository.get_full_external_pipeline(job_name))
             for job_name in job_names
             if self._external_repository.has_external_pipeline(job_name)
+        ]
+
+    def resolve_partitionKeys(self, _graphene_info):
+        # TODO: Add functionality for dynamic partitions definition
+        partitions_def_data = self._external_asset_node.partitions_def_data
+        if partitions_def_data:
+            if isinstance(
+                partitions_def_data, ExternalStaticPartitionsDefinitionData
+            ) or isinstance(partitions_def_data, ExternalTimeWindowPartitionsDefinitionData):
+                return [
+                    partition.name
+                    for partition in partitions_def_data.get_partitions_definition().get_partitions()
+                ]
+        return []
+
+    def resolve_latestMaterializationByPartition(self, _graphene_info, **kwargs):
+        from ..implementation.fetch_assets import get_asset_events
+
+        get_partition = (
+            lambda event: event.dagster_event.step_materialization_data.materialization.partition
+        )
+
+        partitions = kwargs.get("partitions")
+        events_for_partitions = get_asset_events(
+            _graphene_info,
+            self._external_asset_node.asset_key,
+            partitions,
+        )
+
+        latest_materialization_by_partition = {}
+        for event in events_for_partitions:  # events are sorted in order of newest to oldest
+            event_partition = get_partition(event)
+            if event_partition not in latest_materialization_by_partition:
+                latest_materialization_by_partition[event_partition] = event
+            if len(latest_materialization_by_partition) == len(partitions):
+                break
+
+        # return materializations in the same order as the provided partitions, None if
+        # materialization does not exist
+        ordered_materializations = [
+            latest_materialization_by_partition.get(partition) for partition in partitions
+        ]
+
+        return [
+            GrapheneAssetMaterialization(event=event) if event else None
+            for event in ordered_materializations
         ]
 
 

@@ -1,4 +1,4 @@
-import {gql, useQuery} from '@apollo/client';
+import {gql, useLazyQuery, useQuery} from '@apollo/client';
 import * as React from 'react';
 import {Redirect} from 'react-router-dom';
 
@@ -8,18 +8,22 @@ import {RUN_METADATA_FRAGMENT, ScheduleOrSensorTag} from '../nav/JobMetadata';
 import {LegacyPipelineTag} from '../pipelines/LegacyPipelineTag';
 import {PipelineReference} from '../pipelines/PipelineReference';
 import {RunStatusIndicator} from '../runs/RunStatusDots';
+import {RunStatusPezList} from '../runs/RunStatusPez';
 import {
   failedStatuses,
   inProgressStatuses,
   queuedStatuses,
   successStatuses,
 } from '../runs/RunStatuses';
+import {JobMap, RunTimeline} from '../runs/RunTimeline';
 import {RunElapsed, RunTime, RUN_TIME_FRAGMENT} from '../runs/RunUtils';
+import {RunTimeFragment} from '../runs/types/RunTimeFragment';
 import {SCHEDULE_SWITCH_FRAGMENT} from '../schedules/ScheduleSwitch';
 import {SENSOR_SWITCH_FRAGMENT} from '../sensors/SensorSwitch';
-import {RunStatus} from '../types/globalTypes';
+import {InstigationStatus, RunStatus} from '../types/globalTypes';
 import {Box} from '../ui/Box';
-import {ButtonWIP} from '../ui/Button';
+import {AnchorButton, ButtonWIP} from '../ui/Button';
+import {ButtonGroup} from '../ui/ButtonGroup';
 import {ColorsWIP} from '../ui/Colors';
 import {IconWIP} from '../ui/Icon';
 import {MenuItemWIP, MenuWIP} from '../ui/Menu';
@@ -36,9 +40,14 @@ import {useRepositoryOptions} from '../workspace/WorkspaceContext';
 import {buildRepoAddress} from '../workspace/buildRepoAddress';
 import {repoAddressAsString} from '../workspace/repoAddressAsString';
 import {RepoAddress} from '../workspace/types';
+import {workspacePipelinePath} from '../workspace/workspacePath';
 
 import {InstanceTabs} from './InstanceTabs';
+import {JobMenu} from './JobMenu';
+import {NextTick, SCHEDULE_FUTURE_TICKS_FRAGMENT} from './NextTick';
+import {StepSummaryForRun} from './StepSummaryForRun';
 import {InstanceOverviewInitialQuery} from './types/InstanceOverviewInitialQuery';
+import {LastTenRunsPerJobQuery} from './types/LastTenRunsPerJobQuery';
 import {OverviewJobFragment} from './types/OverviewJobFragment';
 
 export const InstanceOverviewPage = () => {
@@ -72,9 +81,17 @@ const intent = (status: RunStatus) => {
   }
 };
 
+const makeJobKey = (repoAddress: RepoAddress, jobName: string) => {
+  return `${jobName}-${repoAddressAsString(repoAddress)}`;
+};
+
 type JobItem = {
   job: OverviewJobFragment;
   repoAddress: RepoAddress;
+};
+
+type JobItemWithRuns = JobItem & {
+  runs: RunTimeFragment[];
 };
 
 type State = {
@@ -108,8 +125,15 @@ const OverviewContent = () => {
   const [state, dispatch] = React.useReducer(reducer, initialState);
   const {options} = useRepositoryOptions();
   const {data, loading} = useQuery<InstanceOverviewInitialQuery>(INSTANCE_OVERVIEW_INITIAL_QUERY);
+  const [retrieveLastTenRuns, {data: lastTenRunsData}] = useLazyQuery<LastTenRunsPerJobQuery>(
+    LAST_TEN_RUNS_PER_JOB_QUERY,
+  );
 
   const {hiddenRepos, searchValue} = state;
+
+  React.useEffect(() => {
+    retrieveLastTenRuns();
+  }, [retrieveLastTenRuns]);
 
   const optionAddresses = React.useMemo(() => {
     if (!options) {
@@ -127,6 +151,7 @@ const OverviewContent = () => {
     const succeeded = [];
     const queued = [];
     const neverRan = [];
+    const scheduled = [];
 
     const sortFn = (a: JobItem, b: JobItem) => {
       const aRun = a.job.runs[0] || null;
@@ -156,15 +181,17 @@ const OverviewContent = () => {
         ) {
           for (const repository of locationEntry.locationOrLoadError.repositories) {
             for (const pipeline of repository.pipelines) {
-              const {runs} = pipeline;
+              const {runs, schedules} = pipeline;
+              const repoAddress = buildRepoAddress(
+                repository.name,
+                locationEntry.locationOrLoadError.name,
+              );
+
               if (runs.length) {
                 const {status} = runs[0];
                 const item = {
                   job: pipeline,
-                  repoAddress: buildRepoAddress(
-                    repository.name,
-                    locationEntry.locationOrLoadError.name,
-                  ),
+                  repoAddress,
                 };
                 if (failedStatuses.has(status)) {
                   failed.push(item);
@@ -178,6 +205,20 @@ const OverviewContent = () => {
                   neverRan.push(item);
                 }
               }
+
+              if (schedules.length) {
+                const anyFutureTicks = schedules.some(
+                  ({scheduleState, futureTicks}) =>
+                    scheduleState.status === InstigationStatus.RUNNING &&
+                    futureTicks.results.length > 0,
+                );
+                if (anyFutureTicks) {
+                  scheduled.push({
+                    job: pipeline,
+                    repoAddress,
+                  });
+                }
+              }
             }
           }
         }
@@ -189,8 +230,9 @@ const OverviewContent = () => {
     queued.sort(sortFn);
     succeeded.sort(sortFn);
     neverRan.sort(sortFn);
+    scheduled.sort(sortFn);
 
-    return {failed, inProgress, queued, succeeded, neverRan};
+    return {failed, inProgress, queued, succeeded, neverRan, scheduled};
   }, [data]);
 
   const filteredJobs = React.useMemo(() => {
@@ -201,15 +243,134 @@ const OverviewContent = () => {
       return !hiddenRepos.has(repoAddress) && name.toLocaleLowerCase().includes(searchToLower);
     };
 
-    const {failed, inProgress, queued, succeeded, neverRan} = bucketed;
+    const {failed, inProgress, queued, succeeded, neverRan, scheduled} = bucketed;
     return {
       failed: failed.filter(filterJobs),
       inProgress: inProgress.filter(filterJobs),
       queued: queued.filter(filterJobs),
       succeeded: succeeded.filter(filterJobs),
       neverRan: neverRan.filter(filterJobs),
+      scheduled: scheduled.filter(filterJobs),
     };
   }, [bucketed, hiddenRepos, searchValue]);
+
+  const lastTenRunsFlattened = React.useMemo(() => {
+    if (!lastTenRunsData) {
+      return null;
+    }
+
+    const flattened: {[key: string]: RunTimeFragment[]} = {};
+    if (lastTenRunsData && lastTenRunsData?.workspaceOrError.__typename === 'Workspace') {
+      for (const locationEntry of lastTenRunsData.workspaceOrError.locationEntries) {
+        if (
+          locationEntry.__typename === 'WorkspaceLocationEntry' &&
+          locationEntry.locationOrLoadError?.__typename === 'RepositoryLocation'
+        ) {
+          for (const repository of locationEntry.locationOrLoadError.repositories) {
+            for (const pipeline of repository.pipelines) {
+              const jobKey = makeJobKey(
+                buildRepoAddress(repository.name, locationEntry.locationOrLoadError.name),
+                pipeline.name,
+              );
+              flattened[jobKey] = pipeline.runs;
+            }
+          }
+        }
+      }
+    }
+
+    return flattened;
+  }, [lastTenRunsData]);
+
+  const filteredJobsWithRuns = React.useMemo(() => {
+    const appendRuns = (jobItem: JobItem) => {
+      const {job, repoAddress} = jobItem;
+      const jobKey = makeJobKey(repoAddress, job.name);
+      const matchingRuns = lastTenRunsFlattened ? lastTenRunsFlattened[jobKey] : [];
+      return {...jobItem, runs: [...matchingRuns].reverse()};
+    };
+
+    const {failed, inProgress, queued, succeeded, neverRan} = filteredJobs;
+    return {
+      failed: failed.map(appendRuns),
+      inProgress: inProgress.map(appendRuns),
+      queued: queued.map(appendRuns),
+      succeeded: succeeded.map(appendRuns),
+      neverRan: neverRan.map(appendRuns),
+    };
+  }, [lastTenRunsFlattened, filteredJobs]);
+
+  const {scheduled} = filteredJobs;
+  const jobMapForTimeline: JobMap = React.useMemo(() => {
+    const jobMap = Object.keys(filteredJobsWithRuns).reduce((accum, status) => {
+      const jobsForStatus: JobItemWithRuns[] = filteredJobsWithRuns[status];
+      const toAppend = {};
+      for (const jobItem of jobsForStatus) {
+        const {repoAddress, runs, job} = jobItem;
+        const jobKey = makeJobKey(repoAddress, job.name);
+        toAppend[jobKey] = {
+          label: job.name,
+          path: workspacePipelinePath({
+            repoName: repoAddress.name,
+            repoLocation: repoAddress.location,
+            pipelineName: job.name,
+            isJob: job.isJob,
+          }),
+          runs: runs.map((run) => ({
+            id: run.id,
+            status: run.status,
+            startTime:
+              run.stats?.__typename === 'RunStatsSnapshot' && run.stats.startTime
+                ? run.stats.startTime * 1000
+                : null,
+            endTime:
+              run.stats?.__typename === 'RunStatsSnapshot' && run.stats.endTime
+                ? run.stats.endTime * 1000
+                : null,
+          })),
+        };
+      }
+      return {...accum, ...toAppend};
+    }, {} as JobMap);
+
+    for (const jobItem of scheduled) {
+      const {job, repoAddress} = jobItem;
+      const jobKey = makeJobKey(repoAddress, job.name);
+
+      // If there are no runs tracked for this job yet because they're only scheduled,
+      // add an entry.
+      if (!jobMap.hasOwnProperty(jobKey)) {
+        jobMap[jobKey] = {
+          label: job.name,
+          path: workspacePipelinePath({
+            repoName: repoAddress.name,
+            repoLocation: repoAddress.location,
+            pipelineName: job.name,
+            isJob: job.isJob,
+          }),
+          runs: [],
+        };
+      }
+
+      const {runs} = jobMap[jobKey];
+      const {schedules} = job;
+      for (const schedule of schedules) {
+        if (schedule.scheduleState.status === InstigationStatus.RUNNING) {
+          schedule.futureTicks.results.forEach(({timestamp}) => {
+            const startTime = timestamp * 1000;
+            runs.push({
+              id: `${jobKey}-future-run-${timestamp}`,
+              status: 'SCHEDULED',
+              startTime,
+              endTime: startTime + 10 * 1000,
+            });
+          });
+        }
+      }
+    }
+
+    return jobMap;
+  }, [filteredJobsWithRuns, scheduled]);
 
   if (loading) {
     return (
@@ -258,7 +419,7 @@ const OverviewContent = () => {
     return null;
   };
 
-  const {failed, inProgress, queued, succeeded, neverRan} = filteredJobs;
+  const {failed, inProgress, queued, succeeded, neverRan} = filteredJobsWithRuns;
 
   return (
     <>
@@ -275,6 +436,7 @@ const OverviewContent = () => {
           style={{width: '340px'}}
         />
       </Box>
+      <RunTimelineSection jobs={jobMapForTimeline} />
       {inProgress.length ? (
         <JobSection
           icon={<IconWIP name="hourglass_bottom" color={ColorsWIP.Blue500} size={24} />}
@@ -318,10 +480,67 @@ const OverviewContent = () => {
   );
 };
 
+interface RunTimelineSectionProps {
+  jobs: JobMap;
+}
+
+type HourWindow = '1' | '6' | '12' | '24';
+const LOOKAHEAD_HOURS = 1;
+const ONE_HOUR = 60 * 60 * 1000;
+
+const RunTimelineSection = (props: RunTimelineSectionProps) => {
+  const {jobs} = props;
+  const [shown, setShown] = React.useState(true);
+  const [hourWindow, setHourWindow] = React.useState<HourWindow>('6');
+  const now = Date.now();
+
+  const range: [number, number] = React.useMemo(
+    () => [now - Number(hourWindow) * ONE_HOUR, now + LOOKAHEAD_HOURS * ONE_HOUR],
+    [hourWindow, now],
+  );
+
+  return (
+    <>
+      <Box
+        flex={{direction: 'row', alignItems: 'center', justifyContent: 'space-between'}}
+        margin={{top: 16}}
+        padding={{bottom: 16, horizontal: 24}}
+        border={{side: 'bottom', width: 1, color: ColorsWIP.KeylineGray}}
+      >
+        <Box flex={{alignItems: 'center', gap: 8}}>
+          <IconWIP name="waterfall_chart" color={ColorsWIP.Gray900} size={20} />
+          <Heading>Timeline</Heading>
+        </Box>
+        <Box flex={{alignItems: 'center', gap: 8}}>
+          {shown ? (
+            <ButtonGroup<HourWindow>
+              activeItems={new Set([hourWindow])}
+              buttons={[
+                {id: '1', label: '1hr'},
+                {id: '6', label: '6hr'},
+                {id: '12', label: '12hr'},
+                {id: '24', label: '24hr'},
+              ]}
+              onClick={(hrWindow: HourWindow) => setHourWindow(hrWindow)}
+            />
+          ) : null}
+          <ButtonWIP
+            icon={<IconWIP name={shown ? 'unfold_less' : 'unfold_more'} />}
+            onClick={() => setShown((current) => !current)}
+          >
+            {shown ? 'Hide' : 'Show'}
+          </ButtonWIP>
+        </Box>
+      </Box>
+      {shown ? <RunTimeline jobs={jobs} range={range} /> : null}
+    </>
+  );
+};
+
 interface JobSectionProps {
   icon: React.ReactNode;
   heading: React.ReactNode;
-  jobs: JobItem[];
+  jobs: JobItemWithRuns[];
 }
 
 const JobSection = (props: JobSectionProps) => {
@@ -340,52 +559,86 @@ const JobSection = (props: JobSectionProps) => {
         <thead>
           <tr>
             <th style={{width: '40%'}}>Job</th>
-            <th style={{width: '30%'}}>Trigger</th>
-            <th style={{width: '30%'}}>Latest run</th>
+            <th style={{width: '25%'}}>Trigger</th>
+            <th style={{width: '35%'}}>Latest run</th>
             <th />
           </tr>
         </thead>
         <tbody>
-          {jobs.map(({job, repoAddress}) => (
-            <tr key={`${job.name}-${repoAddressAsString(repoAddress)}`}>
-              <td>
-                <Box flex={{direction: 'column', gap: 4}}>
-                  <Box flex={{direction: 'row', gap: 8, alignItems: 'center'}}>
-                    <PipelineReference
-                      pipelineName={job.name}
-                      isJob={job.isJob}
-                      pipelineHrefContext={repoAddress}
-                    />
-                    {!job.isJob ? <LegacyPipelineTag /> : null}
-                  </Box>
-                  <Body color={ColorsWIP.Gray400} style={{fontFamily: FontFamily.monospace}}>
-                    {repoAddressAsString(repoAddress)}
-                  </Body>
-                </Box>
-              </td>
-              <td>
-                {job.schedules.length || job.sensors.length ? (
-                  <ScheduleOrSensorTag job={job} repoAddress={repoAddress} />
-                ) : (
-                  <div style={{color: ColorsWIP.Gray500}}>None</div>
-                )}
-              </td>
-              <td>
-                <Box flex={{direction: 'row', justifyContent: 'space-between'}}>
-                  <TagWIP intent={intent(job.runs[0].status)}>
-                    <Box flex={{direction: 'row', alignItems: 'center', gap: 4}}>
-                      <RunStatusIndicator status={job.runs[0].status} size={10} />
-                      <RunTime run={job.runs[0]} />
+          {jobs.map(({job, repoAddress, runs}) => {
+            const jobKey = makeJobKey(repoAddress, job.name);
+            return (
+              <tr key={jobKey}>
+                <td>
+                  <Box
+                    flex={{
+                      direction: 'row',
+                      justifyContent: 'space-between',
+                      alignItems: 'flex-start',
+                    }}
+                  >
+                    <Box flex={{direction: 'column', gap: 4}}>
+                      <Box flex={{direction: 'row', gap: 8, alignItems: 'center'}}>
+                        <PipelineReference
+                          pipelineName={job.name}
+                          isJob={job.isJob}
+                          pipelineHrefContext={repoAddress}
+                        />
+                        {!job.isJob ? <LegacyPipelineTag /> : null}
+                      </Box>
+                      <Body color={ColorsWIP.Gray400} style={{fontFamily: FontFamily.monospace}}>
+                        {repoAddressAsString(repoAddress)}
+                      </Body>
                     </Box>
-                  </TagWIP>
-                  <RunElapsed run={job.runs[0]} />
-                </Box>
-              </td>
-              <td>
-                <ButtonWIP icon={<IconWIP name="expand_more" />} />
-              </td>
-            </tr>
-          ))}
+                    {runs ? (
+                      <Box margin={{top: 4}}>
+                        <RunStatusPezList fade runs={runs} />
+                      </Box>
+                    ) : null}
+                  </Box>
+                </td>
+                <td>
+                  {job.schedules.length || job.sensors.length ? (
+                    <Box flex={{direction: 'column', alignItems: 'flex-start', gap: 8}}>
+                      <ScheduleOrSensorTag job={job} repoAddress={repoAddress} />
+                      {job.schedules.length ? <NextTick schedules={job.schedules} /> : null}
+                    </Box>
+                  ) : (
+                    <div style={{color: ColorsWIP.Gray500}}>None</div>
+                  )}
+                </td>
+                <td>
+                  <Box
+                    flex={{
+                      direction: 'row',
+                      justifyContent: 'space-between',
+                      alignItems: 'flex-start',
+                    }}
+                  >
+                    <Box flex={{direction: 'column', alignItems: 'flex-start', gap: 8}}>
+                      <TagWIP intent={intent(job.runs[0].status)}>
+                        <Box flex={{direction: 'row', alignItems: 'center', gap: 4}}>
+                          <RunStatusIndicator status={job.runs[0].status} size={10} />
+                          <RunTime run={job.runs[0]} />
+                        </Box>
+                      </TagWIP>
+                      {failedStatuses.has(job.runs[0].status) ||
+                      inProgressStatuses.has(job.runs[0].status) ? (
+                        <StepSummaryForRun runId={job.runs[0].id} />
+                      ) : null}
+                    </Box>
+                    <Box flex={{direction: 'row', alignItems: 'center', gap: 8}}>
+                      <RunElapsed run={job.runs[0]} />
+                      <AnchorButton to={`/instance/runs/${job.runs[0].id}`}>View run</AnchorButton>
+                    </Box>
+                  </Box>
+                </td>
+                <td>
+                  <JobMenu job={job} repoAddress={repoAddress} />
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </Table>
     </>
@@ -404,12 +657,10 @@ const OVERVIEW_JOB_FRAGMENT = gql`
       status
       ...RunMetadataFragment
       ...RunTimeFragment
-      __typename
     }
     modes {
       id
       name
-      __typename
     }
     schedules {
       id
@@ -418,10 +669,9 @@ const OVERVIEW_JOB_FRAGMENT = gql`
       scheduleState {
         id
         status
-        __typename
       }
+      ...ScheduleFutureTicksFragment
       ...ScheduleSwitchFragment
-      __typename
     }
     sensors {
       id
@@ -429,20 +679,17 @@ const OVERVIEW_JOB_FRAGMENT = gql`
       targets {
         mode
         pipelineName
-        __typename
       }
       sensorState {
         id
         status
-        __typename
       }
       ...SensorSwitchFragment
-      __typename
     }
-    __typename
   }
 
   ${SCHEDULE_SWITCH_FRAGMENT}
+  ${SCHEDULE_FUTURE_TICKS_FRAGMENT}
   ${SENSOR_SWITCH_FRAGMENT}
   ${RUN_METADATA_FRAGMENT}
   ${RUN_TIME_FRAGMENT}
@@ -451,17 +698,14 @@ const OVERVIEW_JOB_FRAGMENT = gql`
 const INSTANCE_OVERVIEW_INITIAL_QUERY = gql`
   query InstanceOverviewInitialQuery {
     workspaceOrError {
-      __typename
       ... on Workspace {
         locationEntries {
-          __typename
           id
           name
           loadStatus
           displayMetadata {
             key
             value
-            __typename
           }
           locationOrLoadError {
             ... on RepositoryLocation {
@@ -473,21 +717,15 @@ const INSTANCE_OVERVIEW_INITIAL_QUERY = gql`
                 pipelines {
                   id
                   ...OverviewJobFragment
-                  __typename
                 }
                 ...RepositoryInfoFragment
-                __typename
               }
-              __typename
             }
             ... on PythonError {
               ...PythonErrorFragment
-              __typename
             }
-            __typename
           }
         }
-        __typename
       }
       ...PythonErrorFragment
     }
@@ -496,4 +734,42 @@ const INSTANCE_OVERVIEW_INITIAL_QUERY = gql`
   ${OVERVIEW_JOB_FRAGMENT}
   ${REPOSITORY_INFO_FRAGMENT}
   ${PYTHON_ERROR_FRAGMENT}
+`;
+
+const LAST_TEN_RUNS_PER_JOB_QUERY = gql`
+  query LastTenRunsPerJobQuery {
+    workspaceOrError {
+      ... on Workspace {
+        locationEntries {
+          id
+          locationOrLoadError {
+            ... on RepositoryLocation {
+              id
+              name
+              repositories {
+                id
+                name
+                pipelines {
+                  id
+                  name
+                  isJob
+                  runs(limit: 10) {
+                    id
+                    ...RunTimeFragment
+                  }
+                }
+              }
+            }
+            ... on PythonError {
+              ...PythonErrorFragment
+            }
+          }
+        }
+      }
+      ...PythonErrorFragment
+    }
+  }
+
+  ${PYTHON_ERROR_FRAGMENT}
+  ${RUN_TIME_FRAGMENT}
 `;

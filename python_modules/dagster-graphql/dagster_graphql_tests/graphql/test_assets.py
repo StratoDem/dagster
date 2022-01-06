@@ -99,7 +99,10 @@ GET_ASSET_IN_PROGRESS_RUNS = """
                 assetNodes {
                     opName
                     description
-                    jobName
+                    jobs {
+                        id
+                        name
+                    }
                 }
                 inProgressRunsByStep {
                     stepKey
@@ -122,6 +125,43 @@ GET_ASSET_NODES_FROM_KEYS = """
                 id
                 assetNodes(assetKeys: $assetKeys) {
                     id
+                }
+            }
+        }
+    }
+"""
+
+
+GET_ASSET_PARTITIONS_FROM_KEYS = """
+    query AssetNodeQuery($pipelineSelector: PipelineSelector!) {
+        pipelineOrError(params: $pipelineSelector) {
+            ... on Pipeline {
+                id
+                assetNodes {
+                    id
+                    partitionKeys
+                }
+            }
+        }
+    }
+"""
+
+GET_LATEST_MATERIALIZATION_PER_PARTITION = """
+    query AssetNodeQuery($pipelineSelector: PipelineSelector!, $partitions: [String!]) {
+        pipelineOrError(params: $pipelineSelector) {
+            ... on Pipeline {
+                id
+                assetNodes {
+                    id
+                    partitionKeys
+                    latestMaterializationByPartition(partitions: $partitions) {
+                        partition
+                        materializationEvent {
+                            stepStats {
+                                startTime
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -323,6 +363,117 @@ class TestAssetAwareEventLog(
         assert len(result.data["pipelineOrError"]["assetNodes"]) == 2
         asset_node = result.data["pipelineOrError"]["assetNodes"][0]
         assert asset_node["id"] == '["asset_one"]'
+
+    def test_asset_partitions_in_pipeline(self, graphql_context):
+        selector = infer_pipeline_selector(graphql_context, "two_assets_job")
+        result = execute_dagster_graphql(
+            graphql_context,
+            GET_ASSET_PARTITIONS_FROM_KEYS,
+            variables={"pipelineSelector": selector},
+        )
+
+        assert result.data
+        assert result.data["pipelineOrError"]
+        assert result.data["pipelineOrError"]["assetNodes"]
+        assert len(result.data["pipelineOrError"]["assetNodes"]) == 2
+        asset_node = result.data["pipelineOrError"]["assetNodes"][0]
+        assert asset_node["partitionKeys"] == []
+
+        selector = infer_pipeline_selector(graphql_context, "static_partitioned_assets_job")
+        result = execute_dagster_graphql(
+            graphql_context,
+            GET_ASSET_PARTITIONS_FROM_KEYS,
+            variables={"pipelineSelector": selector},
+        )
+
+        assert result.data
+        assert result.data["pipelineOrError"]
+        assert result.data["pipelineOrError"]["assetNodes"]
+        assert len(result.data["pipelineOrError"]["assetNodes"]) == 2
+        asset_node = result.data["pipelineOrError"]["assetNodes"][0]
+        assert asset_node["partitionKeys"] and asset_node["partitionKeys"] == [
+            "a",
+            "b",
+            "c",
+            "d",
+        ]
+        asset_node = result.data["pipelineOrError"]["assetNodes"][1]
+        assert asset_node["partitionKeys"] and asset_node["partitionKeys"] == [
+            "a",
+            "b",
+            "c",
+            "d",
+        ]
+
+        selector = infer_pipeline_selector(graphql_context, "time_partitioned_assets_job")
+        result = execute_dagster_graphql(
+            graphql_context,
+            GET_ASSET_PARTITIONS_FROM_KEYS,
+            variables={"pipelineSelector": selector},
+        )
+
+        assert result.data
+        assert result.data["pipelineOrError"]
+        assert result.data["pipelineOrError"]["assetNodes"]
+        assert len(result.data["pipelineOrError"]["assetNodes"]) == 2
+        asset_node = result.data["pipelineOrError"]["assetNodes"][0]
+
+        # test partition starts at "2021-05-05-01:00". Should be > 100 partition keys
+        # since partition is hourly
+        assert asset_node["partitionKeys"] and len(asset_node["partitionKeys"]) > 100
+        assert asset_node["partitionKeys"][0] == "2021-05-05-01:00"
+        assert asset_node["partitionKeys"][1] == "2021-05-05-02:00"
+
+    def test_latest_materialization_per_partition(self, graphql_context):
+        _create_run(graphql_context, "partition_materialization_job")
+
+        selector = infer_pipeline_selector(graphql_context, "partition_materialization_job")
+        result = execute_dagster_graphql(
+            graphql_context,
+            GET_LATEST_MATERIALIZATION_PER_PARTITION,
+            variables={"pipelineSelector": selector, "partitions": ["a"]},
+        )
+
+        assert result.data
+        assert result.data["pipelineOrError"]
+        assert result.data["pipelineOrError"]["assetNodes"]
+        asset_node = result.data["pipelineOrError"]["assetNodes"][0]
+        assert len(asset_node["latestMaterializationByPartition"]) == 1
+        assert asset_node["latestMaterializationByPartition"][0] == None
+
+        result = execute_dagster_graphql(
+            graphql_context,
+            GET_LATEST_MATERIALIZATION_PER_PARTITION,
+            variables={"pipelineSelector": selector, "partitions": ["c"]},
+        )
+
+        assert result.data
+        assert result.data["pipelineOrError"]
+        assert result.data["pipelineOrError"]["assetNodes"]
+        asset_node = result.data["pipelineOrError"]["assetNodes"][0]
+        assert len(asset_node["latestMaterializationByPartition"]) == 1
+        materialization = asset_node["latestMaterializationByPartition"][0]
+        start_time = materialization["materializationEvent"]["stepStats"]["startTime"]
+        assert materialization["partition"] == "c"
+
+        _create_run(graphql_context, "partition_materialization_job")
+        result = execute_dagster_graphql(
+            graphql_context,
+            GET_LATEST_MATERIALIZATION_PER_PARTITION,
+            variables={"pipelineSelector": selector, "partitions": ["c", "a"]},
+        )
+        assert (
+            result.data
+            and result.data["pipelineOrError"]
+            and result.data["pipelineOrError"]["assetNodes"]
+        )
+        asset_node = result.data["pipelineOrError"]["assetNodes"][0]
+        assert len(asset_node["latestMaterializationByPartition"]) == 2
+        materialization = asset_node["latestMaterializationByPartition"][0]
+        new_start_time = materialization["materializationEvent"]["stepStats"]["startTime"]
+        assert new_start_time > start_time
+
+        assert asset_node["latestMaterializationByPartition"][1] == None
 
 
 class TestPersistentInstanceAssetInProgress(

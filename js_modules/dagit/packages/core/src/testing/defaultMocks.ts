@@ -1,7 +1,7 @@
 import faker from 'faker';
 
 export const hyphenatedName = () => faker.random.words(2).replace(/ /g, '-').toLowerCase();
-const randomId = () => faker.random.uuid();
+const randomId = () => faker.datatype.uuid();
 
 /**
  * A set of default values to use for Jest GraphQL mocks.
@@ -60,6 +60,10 @@ export const defaultMocks = {
   }),
   Solid: () => ({
     name: hyphenatedName,
+  }),
+  PythonError: () => ({
+    message: () => 'A wild python error appeared!',
+    stack: () => [],
   }),
 
   // Disambiguate error unions. If you'd like to mock an error, define a custom mock
