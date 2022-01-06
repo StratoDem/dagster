@@ -4,11 +4,7 @@ from setuptools import find_packages, setup  # type: ignore
 
 
 def get_version() -> str:
-    version: Dict[str, str] = {}
-    with open("dagster_celery_k8s/version.py") as fp:
-        exec(fp.read(), version)  # pylint: disable=W0122
-
-    return version["__version__"]
+    return "0.13.12"
 
 
 if __name__ == "__main__":
